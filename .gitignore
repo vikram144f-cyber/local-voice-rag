@@ -1,0 +1,65 @@
+# Virtual environment
+venv/
+.venv/
+
+# Model weights (HUGE files)
+*.gguf
+*.bin
+*.safetensors
+models/
+
+# Vector stores
+vectorstore/
+faiss_db/
+
+# Uploads and user data
+uploads/
+temp/
+temp_audio/
+your_notes.pdf
+uploaded_files.json
+*.xlsx
+*.xls
+*.csv
+*.pdf
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Streamlit
+.streamlit/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Node modules (if React frontend)
+node_modules/
+
+# IDEs
+.vscode/
+.idea/
+
+# Large files / download archives
+*.crdownload
+*.tar.gz
+*.zip
+*.tgz
+
+# AI Agent Skills and Customizations
+.agents/
+.gemini/
