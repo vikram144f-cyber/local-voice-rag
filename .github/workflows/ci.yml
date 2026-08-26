@@ -13,8 +13,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install test runner
-        run: python -m pip install --upgrade pytest
+      - name: Install lightweight backend test dependencies
+        run: python -m pip install --upgrade -r backend/requirements-dev.txt fastapi python-multipart python-dotenv pydantic
       - name: Compile Python sources
         run: python -m compileall -q backend eval
       - name: Run dependency-free backend tests

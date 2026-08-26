@@ -68,6 +68,7 @@ def load_vectorstore():
     global _vectorstore_cache
     if _vectorstore_cache is not None:
         return _vectorstore_cache
+    # The index location is server configuration; no API request accepts a filesystem path.
     if not os.path.exists(os.path.join(VECTORSTORE_DIR, "index.faiss")):
         return None
     try:
