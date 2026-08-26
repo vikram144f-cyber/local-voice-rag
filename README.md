@@ -1,6 +1,6 @@
 # Local Voice & Text RAG Assistant
 
-A local-first voice and text Retrieval-Augmented Generation (RAG) application for asking questions about uploaded PDFs. The browser talks to a local FastAPI service; embeddings, retrieval, GGUF generation, speech-to-text, and optional text-to-speech are designed to run on the host machine after the required models and dependencies are installed.
+A local-first voice and text Retrieval-Augmented Generation (RAG) application for asking questions about uploaded PDFs. The browser talks to a local FastAPI service; embeddings, retrieval, GGUF generation, and speech-to-text run on the host after the required models and dependencies are installed, while the supported response playback path uses browser speech synthesis.
 
 The first setup may download Python packages and model weights. “Local-first” describes the application architecture, not a guarantee about every machine, browser, or network configuration.
 
@@ -12,7 +12,7 @@ The first setup may download Python packages and model weights. “Local-first�
 - **Local Speech-to-Text**: Transcription powered by `faster-whisper` running on the backend host.
 - **Local Retrieval-Augmented Generation**: PDF ingestion and chunking with local FAISS vector embeddings (`sentence-transformers`).
 - **Local LLM Inference**: GGUF model execution using `llama-cpp-python` with streaming token responses.
-- **Local Text-to-Speech**: Optional TTS output via `pyttsx3`.
+- **Browser Text-to-Speech**: Streaming responses can be spoken with the browser `SpeechSynthesis` API.
 - **Modern Web Interface**: Built with React, Vite, and custom CSS for an interactive user experience.
 
 ---
@@ -34,7 +34,7 @@ flowchart LR
     PROMPT --> LLM[Local GGUF via llama.cpp]
     LLM --> F
     F --> TTS[Browser speech synthesis]
-    API --> HOSTTTS[Optional pyttsx3 on host]
+    API -.-> HOSTTTS[Standalone pyttsx3 helper, not wired]
     RET --> E[Source filenames and page snippets]
     E --> F
 ```
@@ -54,7 +54,7 @@ local-voice-rag/
 │   ├── local_llm.py        # Local LLM wrapper & streaming generation
 │   ├── rag_core.py         # Document ingestion, embedding, & FAISS indexing
 │   ├── voice_input.py      # Local Whisper STT transcription
-│   ├── voice_output.py     # Local TTS speech generation
+│   ├── voice_output.py     # Standalone pyttsx3 TTS helper (not wired)
 │   ├── main.py             # FastAPI REST API endpoints
 │   ├── requirements.txt    # Python dependencies
 │   └── .env.example        # Environment variable template
@@ -98,7 +98,7 @@ local-voice-rag/
      ```
 6. **Start the FastAPI server:**
    ```bash
-   uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+   uvicorn main:app --host 127.0.0.1 --port 8000 --reload
    ```
 
 ---
@@ -134,7 +134,7 @@ python eval/retrieval_eval.py \
 
 ## Security, privacy, and limitations
 
-- Uploaded PDFs and audio are streamed through bounded request limits and PDF uploads must have a PDF signature; do not expose the development server directly to an untrusted network.
+- Uploaded PDFs and audio are streamed through bounded request limits and PDF uploads must have a PDF signature; the development server defaults to localhost and should not be exposed directly to an untrusted network.
 - The generated FAISS index is loaded with LangChain’s dangerous-deserialization option because it is an application-local artifact. Treat `backend/vectorstore/` as trusted local state and do not load an index from an untrusted source.
 - There is no authentication or multi-user isolation in this prototype. Model quality, latency, and memory use depend on the selected GGUF/Whisper models and available CPU/GPU resources.
 - PDF parsing, retrieval, transcription, and generation can fail independently; public API errors are intentionally generic while details remain in backend logs.

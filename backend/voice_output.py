@@ -3,6 +3,8 @@ voice_output.py — Local Text-to-Speech using pyttsx3
 =====================================================
 Speaks text through the laptop speakers using a fully offline TTS engine.
 No internet required. No API calls.
+This helper is standalone and is not wired into the FastAPI handlers; the
+supported application playback path is browser SpeechSynthesis.
 
 Usage:
     from voice_output import speak_text

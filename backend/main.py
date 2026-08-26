@@ -9,9 +9,10 @@ Endpoints:
   POST /api/rebuild            — Rebuild vectorstore (after embedding model change)
   POST /api/voice/transcribe   — Record + transcribe audio on backend machine
   POST /api/voice/upload-audio — Receive audio from browser, transcribe, run RAG
-  POST /api/voice/chat         — Record on backend, transcribe, RAG, speak answer
+  POST /api/voice/chat         — Record on backend, transcribe, RAG, stream answer
 
-No Ollama. No cloud APIs. Everything runs locally.
+No Ollama or hosted inference is required at runtime. First-run package and
+model setup may still download dependencies before the local pipeline runs.
 """
 
 import os
@@ -44,6 +45,8 @@ def _positive_int_env(name: str, default: int) -> int:
 
 MAX_UPLOAD_SIZE_MB = _positive_int_env("MAX_UPLOAD_SIZE_MB", 50)
 MAX_AUDIO_SIZE_MB = _positive_int_env("MAX_AUDIO_SIZE_MB", 25)
+MAX_TRANSCRIPT_CHARS = _positive_int_env("MAX_TRANSCRIPT_CHARS", 4000)
+MAX_PROMPT_CHARS = _positive_int_env("MAX_PROMPT_CHARS", 12000)
 MAX_UPLOAD_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
 MAX_AUDIO_BYTES = MAX_AUDIO_SIZE_MB * 1024 * 1024
 
@@ -51,6 +54,7 @@ from rag_core import (
     process_upload,
     delete_file_and_rebuild,
     rebuild_all_files,
+    replace_file_and_rebuild,
     load_registry,
     load_vectorstore,
     retrieve_context,
@@ -138,6 +142,33 @@ def _stream_answer(prompt: str):
         yield "\n\n**Error:** The local language model could not generate a response."
 
 
+def _validate_transcript(text: str) -> str:
+    normalized = text.strip() if isinstance(text, str) else ""
+    if not normalized:
+        raise HTTPException(status_code=400, detail="Could not transcribe any speech.")
+    if len(normalized) > MAX_TRANSCRIPT_CHARS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Transcript too long. Maximum length is {MAX_TRANSCRIPT_CHARS} characters.",
+        )
+    return normalized
+
+
+def _retrieve_prompt(query: str, file_filter: str, top_k: int):
+    try:
+        vectorstore = load_vectorstore()
+        context_docs = retrieve_context(vectorstore, query, file_filter, top_k)
+        prompt = build_prompt(query, context_docs)
+        if len(prompt) > MAX_PROMPT_CHARS:
+            raise HTTPException(status_code=413, detail="Retrieved context is too large.")
+        return context_docs, prompt
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("RAG retrieval failed")
+        raise HTTPException(status_code=500, detail="Retrieval failed.") from None
+
+
 # ─── Request Models ───────────────────────────────────────────────────────────
 class ChatMessage(BaseModel):
     role: Literal["user", "assistant", "system"]
@@ -189,9 +220,14 @@ def upload_file(file: UploadFile = File(...)):
         if not is_pdf_file(staged_path):
             raise HTTPException(status_code=400, detail="The uploaded file is not a valid PDF.")
 
-        chunks = process_upload(staged_path, safe_name)
-        os.replace(staged_path, file_path)
-        staged_path = None
+        is_replacement = safe_name in load_registry() or os.path.exists(file_path)
+        if is_replacement:
+            chunks = replace_file_and_rebuild(staged_path, safe_name)
+            staged_path = None
+        else:
+            chunks = process_upload(staged_path, safe_name)
+            os.replace(staged_path, file_path)
+            staged_path = None
         return {"message": "File processed successfully", "chunks": chunks, "filename": safe_name}
     except UploadTooLargeError:
         raise HTTPException(
@@ -250,11 +286,8 @@ def chat(request: ChatRequest):
     4. Stream response from local LLM (llama-cpp-python)
     """
     # 1. Retrieve Context
-    vectorstore = load_vectorstore()
-    context_docs = retrieve_context(vectorstore, request.query, request.file_filter, request.top_k)
-
-    # 2. Build Prompt
-    prompt = build_prompt(request.query, context_docs)
+    # 1. Retrieve context and build a bounded prompt.
+    context_docs, prompt = _retrieve_prompt(request.query, request.file_filter, request.top_k)
 
     # 3. Stream Response
     def generate():
@@ -277,8 +310,10 @@ def voice_transcribe(duration: int = Query(default=5, ge=1, le=30)):
         duration: Recording duration in seconds (default: 5, max: 30)
     """
     try:
-        text = listen_and_transcribe(duration=duration)
+        text = _validate_transcript(listen_and_transcribe(duration=duration))
         return {"query": text}
+    except HTTPException:
+        raise
     except Exception:
         logger.exception("Microphone transcription failed")
         raise HTTPException(status_code=500, detail="Transcription failed.") from None
@@ -318,7 +353,9 @@ def voice_upload_audio(
 
     # 2. Transcribe the audio
     try:
-        transcribed_text = transcribe_audio(audio_path)
+        transcribed_text = _validate_transcript(transcribe_audio(audio_path))
+    except HTTPException:
+        raise
     except Exception:
         logger.exception("Uploaded audio transcription failed")
         raise HTTPException(status_code=500, detail="Transcription failed.") from None
@@ -326,13 +363,8 @@ def voice_upload_audio(
         # Clean up temp file
         _remove_file_safely(audio_path)
 
-    if not transcribed_text.strip():
-        raise HTTPException(status_code=400, detail="Could not transcribe any speech from the audio.")
-
     # 3. Run RAG pipeline (same as /api/chat)
-    vectorstore = load_vectorstore()
-    context_docs = retrieve_context(vectorstore, transcribed_text, file_filter, top_k)
-    prompt = build_prompt(transcribed_text, context_docs)
+    context_docs, prompt = _retrieve_prompt(transcribed_text, file_filter, top_k)
 
     # 4. Stream response
     def generate():
@@ -349,32 +381,35 @@ def voice_chat(
     duration: int = Query(default=5, ge=1, le=30),
     file_filter: str = Query(default="All Files"),
     top_k: int = Query(default=5, ge=1, le=10),
-    speak: bool = Query(default=True),
+    speak: bool = Query(
+        default=True,
+        description="Reserved for compatibility; browser speech synthesis handles playback.",
+    ),
 ):
     """
-    Full voice chat: record on backend → transcribe → RAG → stream answer → speak.
+    Full voice chat: record on backend → transcribe → RAG → stream answer.
     Only works when backend runs on the same machine as the user.
+
+    ``speak`` is retained for client compatibility but is not used by the
+    backend; the supported frontend path speaks streamed text in the browser.
 
     Query params:
         duration: Recording duration in seconds
         file_filter: Filter to specific file
         top_k: Number of context chunks
-        speak: Whether to speak the answer via TTS
+        speak: Compatibility parameter; browser speech synthesis handles playback
     """
     # 1. Record and transcribe
     try:
-        transcribed_text = listen_and_transcribe(duration=duration)
+        transcribed_text = _validate_transcript(listen_and_transcribe(duration=duration))
+    except HTTPException:
+        raise
     except Exception:
         logger.exception("Voice chat recording/transcription failed")
         raise HTTPException(status_code=500, detail="Recording/transcription failed.") from None
 
-    if not transcribed_text.strip():
-        raise HTTPException(status_code=400, detail="Could not transcribe any speech.")
-
     # 2. Run RAG pipeline
-    vectorstore = load_vectorstore()
-    context_docs = retrieve_context(vectorstore, transcribed_text, file_filter, top_k)
-    prompt = build_prompt(transcribed_text, context_docs)
+    context_docs, prompt = _retrieve_prompt(transcribed_text, file_filter, top_k)
 
     # 3. Stream response
     def generate():
