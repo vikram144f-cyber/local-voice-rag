@@ -7,8 +7,14 @@ from dotenv import load_dotenv
 import shutil
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
+
+try:
+    from langchain_huggingface import HuggingFaceEmbeddings
+except ModuleNotFoundError:
+    # Keep lightweight API routes importable when the optional embedding adapter
+    # has not been installed yet. The indexing path reports the setup issue.
+    HuggingFaceEmbeddings = None
 
 # ─── Configuration ─────────────────────────────────────────────────────────────
 load_dotenv()
@@ -73,6 +79,11 @@ def get_embeddings():
     """Create local HuggingFace embeddings."""
     global _embeddings
     if _embeddings is None:
+        if HuggingFaceEmbeddings is None:
+            raise RuntimeError(
+                "Embedding dependencies are not installed. "
+                "Install backend/requirements.txt to enable document indexing."
+            )
         import torch
         device = "cuda" if torch.cuda.is_available() else "cpu"
         logger.info("Initializing embeddings on device: %s", device)

@@ -11,10 +11,6 @@ Usage:
 import os
 import uuid
 import logging
-import numpy as np
-import sounddevice as sd
-from scipy.io import wavfile
-from faster_whisper import WhisperModel
 from dotenv import load_dotenv
 
 # ─── Configuration ─────────────────────────────────────────────────────────────
@@ -44,6 +40,14 @@ def _get_whisper_model():
     if _whisper_model is not None:
         return _whisper_model
 
+    try:
+        from faster_whisper import WhisperModel
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "faster-whisper is not installed. "
+            "Install backend/requirements.txt to enable speech-to-text."
+        ) from exc
+
     logger.info("Loading Whisper model: %s", WHISPER_MODEL_SIZE)
     logger.info("First run will download the model, then it works offline")
 
@@ -70,6 +74,15 @@ def record_audio(duration: int = 5, sample_rate: int = SAMPLE_RATE,
     Returns:
         Path to the saved WAV file.
     """
+    try:
+        import sounddevice as sd
+        from scipy.io import wavfile
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "sounddevice and scipy are required for microphone recording. "
+            "Install backend/requirements.txt to enable this endpoint."
+        ) from exc
+
     # Ensure temp directory exists
     os.makedirs(TEMP_AUDIO_DIR, exist_ok=True)
 

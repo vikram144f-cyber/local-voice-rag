@@ -32,7 +32,15 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 # ─── Configuration ─────────────────────────────────────────────────────────────
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
+DEFAULT_CORS_ORIGINS = ("http://localhost:5173", "http://127.0.0.1:5173")
+CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("CORS_ORIGINS", ",".join(DEFAULT_CORS_ORIGINS)).split(",")
+    if origin.strip()
+]
+WARM_MODELS_ON_STARTUP = os.getenv("WARM_MODELS_ON_STARTUP", "0").strip().lower() in {
+    "1", "true", "yes", "on"
+}
 
 
 def _positive_int_env(name: str, default: int) -> int:
@@ -74,15 +82,26 @@ from request_validation import (
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Warm embeddings, vectorstore, and LLM on startup."""
-    logger.info("Warming embeddings and vectorstore...")
-    get_embeddings()
-    load_vectorstore()
-    try:
-        load_llm()
-        logger.info("LLM ready.")
-    except FileNotFoundError as e:
-        logger.warning("LLM not loaded: %s", e)
+    """Start the API without requiring model files or model downloads."""
+    if WARM_MODELS_ON_STARTUP:
+        logger.info("Warming embeddings and vectorstore...")
+        try:
+            get_embeddings()
+            load_vectorstore()
+        except Exception:
+            # Liveness endpoints and file management should remain available when
+            # an optional model/dependency is not installed yet.
+            logger.exception("Embedding/vectorstore warm-up skipped")
+
+        try:
+            load_llm()
+            logger.info("LLM ready.")
+        except FileNotFoundError as e:
+            logger.warning("LLM not loaded: %s", e)
+        except Exception:
+            logger.exception("LLM warm-up skipped")
+    else:
+        logger.info("Model warm-up disabled; models load on first use")
     yield
 
 

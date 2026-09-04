@@ -2,8 +2,9 @@
 
 The FastAPI backend for a local-first voice and text Retrieval-Augmented
 Generation (RAG) application. After setup, embeddings, retrieval, GGUF
-generation, and speech-to-text run on the host machine. The first setup may
-download Python packages and model weights.
+generation, and speech-to-text run on the host machine. The API starts without
+blocking on model warm-up; the first feature request loads the required local
+model. The first setup may download Python packages and model weights.
 
 ---
 
@@ -91,7 +92,11 @@ cd backend
 venv\Scripts\activate
 uvicorn main:app --host 127.0.0.1 --port 8000 --reload
 ```
-Backend runs at: `http://localhost:8000`
+Backend runs at: `http://127.0.0.1:8000`
+
+To warm already-downloaded models during startup, set
+`WARM_MODELS_ON_STARTUP=true` in the backend environment. It is disabled by
+default so `/health` and lightweight API routes remain available during setup.
 
 ### Start Frontend
 ```bash

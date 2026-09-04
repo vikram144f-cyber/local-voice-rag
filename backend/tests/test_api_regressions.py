@@ -186,6 +186,22 @@ class ApiRegressionTests(unittest.TestCase):
         self.assertEqual(valid.status_code, 200)
         self.assertIn("__STATUS__generating__", valid.text)
 
+    def test_http_cors_allows_frontend_loopback_origin(self):
+        with self.TestClient(self.main.app) as client:
+            response = client.options(
+                "/health",
+                headers={
+                    "Origin": "http://127.0.0.1:5173",
+                    "Access-Control-Request-Method": "GET",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.headers.get("access-control-allow-origin"),
+            "http://127.0.0.1:5173",
+        )
+
     def test_http_upload_route_sanitizes_unexpected_processing_errors(self):
         with tempfile.TemporaryDirectory() as directory:
             self.main.UPLOADS_DIR = directory

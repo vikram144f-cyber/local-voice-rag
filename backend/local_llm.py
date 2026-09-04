@@ -11,7 +11,6 @@ Usage:
 import os
 import logging
 from dotenv import load_dotenv
-from llama_cpp import Llama
 
 # ─── Configuration ─────────────────────────────────────────────────────────────
 load_dotenv()
@@ -62,6 +61,14 @@ def load_llm():
             f"Please download a GGUF model and place it in the 'models/' folder.\n"
             f"Example: models/phi-3-mini-4k-instruct-q4.gguf"
         )
+
+    try:
+        from llama_cpp import Llama
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "llama-cpp-python is not installed. "
+            "Install backend/requirements.txt to enable local generation."
+        ) from exc
 
     logger.info("Loading model from: %s", MODEL_PATH)
     logger.info("Using %d CPU threads, context window: %d", N_THREADS, N_CTX)
