@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { fetchFiles, uploadFile, deleteFile, rebuildIndex, chatStream, sendVoiceAudio } from './api';
 import { createStreamingTTS } from './tts';
 import { Send, Upload, Trash2, Cpu, Database, Mic, MicOff, Volume2, VolumeX, RefreshCw } from 'lucide-react';
@@ -45,13 +45,8 @@ export function App() {
     ttsRef.current.setEnabled(autoSpeak);
     if (!autoSpeak) {
       ttsRef.current.stop();
-      setIsSpeaking(false);
     }
   }, [autoSpeak]);
-
-  useEffect(() => {
-    loadFiles();
-  }, []);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -66,7 +61,7 @@ export function App() {
     setIsSpeaking(false);
   }, []);
 
-  const loadFiles = async () => {
+  const loadFiles = useCallback(async () => {
     try {
       const data = await fetchFiles();
       setFiles(data.files);
@@ -75,7 +70,14 @@ export function App() {
       console.error(e);
       setBackendError('Backend unreachable. Start the API server on port 8000.');
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    // loadFiles updates state only after the backend request resolves.
+    // The hook rule cannot infer that async boundary from the callback.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    loadFiles();
+  }, [loadFiles]);
 
   const parseStreamMarkers = (buffer) => {
     let text = buffer;
