@@ -32,6 +32,10 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "512"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "100"))
 
+
+class NoExtractableTextError(ValueError):
+    """Raised when a valid PDF contains no text that can be indexed."""
+
 # Ensure directories exist
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 os.makedirs(VECTORSTORE_DIR, exist_ok=True)
@@ -130,6 +134,10 @@ def process_upload(file_path: str, filename: str):
         chunk_overlap=CHUNK_OVERLAP,
     )
     chunks = text_splitter.split_documents(docs)
+    if not chunks:
+        raise NoExtractableTextError(
+            "The PDF contains no extractable text. Upload a text-based PDF."
+        )
 
     # 3. Embed & Store
     embeddings = get_embeddings()
@@ -256,6 +264,11 @@ def rebuild_all_files(registry_override=None, persist_registry=True):
         )
         chunks = splitter.split_documents(docs)
         all_chunks.extend(chunks)
+
+    if valid_registry and not all_chunks:
+        raise NoExtractableTextError(
+            "No extractable text was found in the uploaded PDFs."
+        )
     
     vectorstore_parent = os.path.dirname(os.path.abspath(VECTORSTORE_DIR)) or "."
     os.makedirs(vectorstore_parent, exist_ok=True)

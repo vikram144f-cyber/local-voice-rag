@@ -68,6 +68,7 @@ from rag_core import (
     retrieve_context,
     build_prompt,
     get_embeddings,
+    NoExtractableTextError,
     UPLOADS_DIR
 )
 from local_llm import stream_response, load_llm
@@ -255,6 +256,8 @@ def upload_file(file: UploadFile = File(...)):
         ) from None
     except HTTPException:
         raise
+    except NoExtractableTextError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception:
         logger.exception("PDF upload failed for %s", safe_name)
         raise HTTPException(status_code=500, detail="PDF processing failed.") from None

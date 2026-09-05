@@ -124,6 +124,32 @@ class RagCoreTests(unittest.TestCase):
         broken = RetrievalStore(error=RuntimeError("private retrieval detail"))
         self.assertEqual(self.rag.retrieve_context(broken, "query"), [])
 
+    def test_process_upload_rejects_pdf_without_extractable_chunks(self):
+        class EmptyLoader:
+            def __init__(self, _path):
+                pass
+
+            def load(self):
+                return [Document("", {"page": 0})]
+
+        class EmptySplitter:
+            def __init__(self, **_kwargs):
+                pass
+
+            def split_documents(self, _documents):
+                return []
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(self.rag, "PyPDFLoader", EmptyLoader), patch.object(
+                self.rag, "RecursiveCharacterTextSplitter", EmptySplitter
+            ):
+                with self.assertRaises(self.rag.NoExtractableTextError) as raised:
+                    self.rag.process_upload(
+                        str(Path(directory, "scan.pdf")), "scan.pdf"
+                    )
+
+        self.assertIn("no extractable text", str(raised.exception))
+
     def test_failed_replacement_restores_previous_file_and_registry_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
             self.rag.UPLOADS_DIR = directory

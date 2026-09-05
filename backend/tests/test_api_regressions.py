@@ -32,6 +32,9 @@ def load_main_with_lightweight_stubs():
     rag_core.retrieve_context = lambda *_args: []
     rag_core.build_prompt = lambda *_args: "prompt"
     rag_core.get_embeddings = lambda: None
+    rag_core.NoExtractableTextError = type(
+        "NoExtractableTextError", (ValueError,), {}
+    )
 
     local_llm = types.ModuleType("local_llm")
     local_llm.stream_response = lambda _prompt: iter(["ok"])
@@ -217,6 +220,29 @@ class ApiRegressionTests(unittest.TestCase):
         self.assertEqual(response.status_code, 500)
         self.assertEqual(response.json()["detail"], "PDF processing failed.")
         self.assertNotIn("secret implementation detail", response.text)
+
+    def test_http_upload_route_explains_pdfs_without_extractable_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.main.UPLOADS_DIR = directory
+            with patch.object(
+                self.main,
+                "process_upload",
+                side_effect=self.main.NoExtractableTextError(
+                    "The PDF contains no extractable text. Upload a text-based PDF."
+                ),
+            ):
+                with self.TestClient(self.main.app) as client:
+                    response = client.post(
+                        "/api/upload",
+                        files={"file": ("scan.pdf", b"%PDF-1.7\ncontent", "application/pdf")},
+                    )
+
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(
+                response.json()["detail"],
+                "The PDF contains no extractable text. Upload a text-based PDF.",
+            )
+            self.assertFalse(Path(directory, "scan.pdf").exists())
 
     def test_voice_and_prompt_limits_and_retrieval_failure_are_publicly_bounded(self):
         with patch.object(self.main, "MAX_TRANSCRIPT_CHARS", 5):
