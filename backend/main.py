@@ -9,55 +9,100 @@ Endpoints:
   POST /api/rebuild            — Rebuild vectorstore (after embedding model change)
   POST /api/voice/transcribe   — Record + transcribe audio on backend machine
   POST /api/voice/upload-audio — Receive audio from browser, transcribe, run RAG
-  POST /api/voice/chat         — Record on backend, transcribe, RAG, speak answer
+  POST /api/voice/chat         — Record on backend, transcribe, RAG, stream answer
 
-No Ollama. No cloud APIs. Everything runs locally.
+No Ollama or hosted inference is required at runtime. First-run package and
+model setup may still download dependencies before the local pipeline runs.
 """
 
 import os
 import json
 import logging
+import tempfile
 from contextlib import asynccontextmanager
+from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-from typing import Optional
+from pydantic import BaseModel, Field, field_validator
+from typing import Literal, Optional
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
 # ─── Configuration ─────────────────────────────────────────────────────────────
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
-MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "50"))
+DEFAULT_CORS_ORIGINS = ("http://localhost:5173", "http://127.0.0.1:5173")
+CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("CORS_ORIGINS", ",".join(DEFAULT_CORS_ORIGINS)).split(",")
+    if origin.strip()
+]
+WARM_MODELS_ON_STARTUP = os.getenv("WARM_MODELS_ON_STARTUP", "0").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s; using default %s", name, default)
+        return default
+
+
+MAX_UPLOAD_SIZE_MB = _positive_int_env("MAX_UPLOAD_SIZE_MB", 50)
+MAX_AUDIO_SIZE_MB = _positive_int_env("MAX_AUDIO_SIZE_MB", 25)
+MAX_TRANSCRIPT_CHARS = _positive_int_env("MAX_TRANSCRIPT_CHARS", 4000)
+MAX_PROMPT_CHARS = _positive_int_env("MAX_PROMPT_CHARS", 12000)
+MAX_UPLOAD_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
+MAX_AUDIO_BYTES = MAX_AUDIO_SIZE_MB * 1024 * 1024
 
 from rag_core import (
     process_upload,
     delete_file_and_rebuild,
     rebuild_all_files,
+    replace_file_and_rebuild,
     load_registry,
     load_vectorstore,
     retrieve_context,
     build_prompt,
     get_embeddings,
+    NoExtractableTextError,
     UPLOADS_DIR
 )
 from local_llm import stream_response, load_llm
 from voice_input import transcribe_audio, listen_and_transcribe, TEMP_AUDIO_DIR
+from request_validation import (
+    UploadTooLargeError,
+    is_pdf_file,
+    sanitize_pdf_filename,
+    save_stream_with_limit,
+)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Warm embeddings, vectorstore, and LLM on startup."""
-    logger.info("Warming embeddings and vectorstore...")
-    get_embeddings()
-    load_vectorstore()
-    try:
-        load_llm()
-        logger.info("LLM ready.")
-    except FileNotFoundError as e:
-        logger.warning("LLM not loaded: %s", e)
+    """Start the API without requiring model files or model downloads."""
+    if WARM_MODELS_ON_STARTUP:
+        logger.info("Warming embeddings and vectorstore...")
+        try:
+            get_embeddings()
+            load_vectorstore()
+        except Exception:
+            # Liveness endpoints and file management should remain available when
+            # an optional model/dependency is not installed yet.
+            logger.exception("Embedding/vectorstore warm-up skipped")
+
+        try:
+            load_llm()
+            logger.info("LLM ready.")
+        except FileNotFoundError as e:
+            logger.warning("LLM not loaded: %s", e)
+        except Exception:
+            logger.exception("LLM warm-up skipped")
+    else:
+        logger.info("Model warm-up disabled; models load on first use")
     yield
 
 
@@ -95,6 +140,17 @@ def _build_sources_payload(context_docs: list) -> list:
     return sources_data
 
 
+def _remove_file_safely(path: Optional[str]) -> None:
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logger.warning("Could not remove temporary file %s", path)
+
+
 def _stream_answer(prompt: str):
     """Yield status marker then LLM tokens."""
     yield "__STATUS__generating__\n"  # parsed as __STATUS__<name>__
@@ -103,16 +159,58 @@ def _stream_answer(prompt: str):
             yield token
     except Exception as e:
         logger.error("LLM streaming error: %s", e)
-        yield f"\n\n**Error:** {str(e)}"
+        yield "\n\n**Error:** The local language model could not generate a response."
+
+
+def _validate_transcript(text: str) -> str:
+    normalized = text.strip() if isinstance(text, str) else ""
+    if not normalized:
+        raise HTTPException(status_code=400, detail="Could not transcribe any speech.")
+    if len(normalized) > MAX_TRANSCRIPT_CHARS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Transcript too long. Maximum length is {MAX_TRANSCRIPT_CHARS} characters.",
+        )
+    return normalized
+
+
+def _retrieve_prompt(query: str, file_filter: str, top_k: int):
+    try:
+        vectorstore = load_vectorstore()
+        context_docs = retrieve_context(vectorstore, query, file_filter, top_k)
+        prompt = build_prompt(query, context_docs)
+        if len(prompt) > MAX_PROMPT_CHARS:
+            raise HTTPException(status_code=413, detail="Retrieved context is too large.")
+        return context_docs, prompt
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("RAG retrieval failed")
+        raise HTTPException(status_code=500, detail="Retrieval failed.") from None
 
 
 # ─── Request Models ───────────────────────────────────────────────────────────
+class ChatMessage(BaseModel):
+    role: Literal["user", "assistant", "system"]
+    content: str = Field(min_length=1, max_length=4000)
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def strip_content(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+
 class ChatRequest(BaseModel):
-    query: str
-    model: Optional[str] = None  # Ignored — using local GGUF model
-    file_filter: str = "All Files"
-    top_k: int = 5
-    messages: list = []  # Chat history (for context if needed)
+    query: str = Field(min_length=1, max_length=4000)
+    model: Optional[str] = Field(default=None, max_length=100)  # Ignored — local GGUF model
+    file_filter: str = Field(default="All Files", min_length=1, max_length=255)
+    top_k: int = Field(default=5, ge=1, le=10)
+    messages: list[ChatMessage] = Field(default_factory=list, max_length=20)
+
+    @field_validator("query", "file_filter", mode="before")
+    @classmethod
+    def strip_text(cls, value):
+        return value.strip() if isinstance(value, str) else value
 
 
 # ─── File Management Endpoints ────────────────────────────────────────────────
@@ -126,45 +224,59 @@ def list_files():
 @app.post("/api/upload")
 def upload_file(file: UploadFile = File(...)):
     """Upload a PDF file, chunk it, embed it, and add to FAISS."""
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
-
-    # Sanitize filename to prevent path traversal attacks
-    safe_name = os.path.basename(file.filename)
-    if not safe_name:
-        raise HTTPException(status_code=400, detail="Invalid filename.")
+    try:
+        safe_name = sanitize_pdf_filename(file.filename or "")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     file_path = os.path.join(UPLOADS_DIR, safe_name)
-    import shutil
-    with open(file_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-        
-    if os.path.getsize(file_path) > MAX_UPLOAD_SIZE_MB * 1024 * 1024:
-        os.remove(file_path)
+    staged_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix=".upload-", suffix=".pdf", dir=UPLOADS_DIR, delete=False
+        ) as staged_file:
+            staged_path = staged_file.name
+        save_stream_with_limit(file.file, staged_path, MAX_UPLOAD_BYTES)
+        if not is_pdf_file(staged_path):
+            raise HTTPException(status_code=400, detail="The uploaded file is not a valid PDF.")
+
+        is_replacement = safe_name in load_registry() or os.path.exists(file_path)
+        if is_replacement:
+            chunks = replace_file_and_rebuild(staged_path, safe_name)
+            staged_path = None
+        else:
+            chunks = process_upload(staged_path, safe_name)
+            os.replace(staged_path, file_path)
+            staged_path = None
+        return {"message": "File processed successfully", "chunks": chunks, "filename": safe_name}
+    except UploadTooLargeError:
         raise HTTPException(
             status_code=413,
             detail=f"File too large. Maximum size is {MAX_UPLOAD_SIZE_MB}MB.",
-        )
-
-    try:
-        chunks = process_upload(file_path, safe_name)
-        return {"message": "File processed successfully", "chunks": chunks, "filename": safe_name}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        ) from None
+    except HTTPException:
+        raise
+    except NoExtractableTextError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception:
+        logger.exception("PDF upload failed for %s", safe_name)
+        raise HTTPException(status_code=500, detail="PDF processing failed.") from None
+    finally:
+        _remove_file_safely(staged_path)
 
 
 @app.delete("/api/files/{filename}")
 def delete_file(filename: str):
     """Delete a file and rebuild the FAISS index from remaining files."""
-    # Sanitize filename to prevent path traversal attacks
-    safe_name = os.path.basename(filename)
-    if not safe_name or safe_name != filename:
-        raise HTTPException(status_code=400, detail="Invalid filename.")
     try:
+        safe_name = sanitize_pdf_filename(filename)
         delete_file_and_rebuild(safe_name)
         return {"message": f"Deleted {safe_name} and rebuilt index."}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception:
+        logger.exception("Delete/rebuild failed for %s", filename)
+        raise HTTPException(status_code=500, detail="File deletion failed.") from None
 
 
 # ─── Rebuild Endpoint ─────────────────────────────────────────────────────────
@@ -179,8 +291,9 @@ def rebuild_index():
     try:
         rebuild_all_files()
         return {"message": "Vectorstore rebuilt successfully with new embeddings."}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("Vectorstore rebuild failed")
+        raise HTTPException(status_code=500, detail="Vectorstore rebuild failed.") from None
 
 
 # ─── Text Chat Endpoint (Streaming) ───────────────────────────────────────────
@@ -195,11 +308,8 @@ def chat(request: ChatRequest):
     4. Stream response from local LLM (llama-cpp-python)
     """
     # 1. Retrieve Context
-    vectorstore = load_vectorstore()
-    context_docs = retrieve_context(vectorstore, request.query, request.file_filter, request.top_k)
-
-    # 2. Build Prompt
-    prompt = build_prompt(request.query, context_docs)
+    # 1. Retrieve context and build a bounded prompt.
+    context_docs, prompt = _retrieve_prompt(request.query, request.file_filter, request.top_k)
 
     # 3. Stream Response
     def generate():
@@ -222,50 +332,61 @@ def voice_transcribe(duration: int = Query(default=5, ge=1, le=30)):
         duration: Recording duration in seconds (default: 5, max: 30)
     """
     try:
-        text = listen_and_transcribe(duration=duration)
+        text = _validate_transcript(listen_and_transcribe(duration=duration))
         return {"query": text}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Microphone transcription failed")
+        raise HTTPException(status_code=500, detail="Transcription failed.") from None
 
 
 @app.post("/api/voice/upload-audio")
 def voice_upload_audio(
     audio: UploadFile = File(...),
-    file_filter: str = "All Files",
-    top_k: int = 5,
+    file_filter: str = Query(default="All Files", min_length=1, max_length=255),
+    top_k: int = Query(default=5, ge=1, le=10),
 ):
     """
     Receive audio from browser MediaRecorder, transcribe it, run RAG pipeline,
     and stream the answer. TTS is handled in the browser.
     """
     # 1. Save uploaded audio to temp file
-    audio_path = os.path.join(TEMP_AUDIO_DIR, f"upload_{os.path.basename(audio.filename)}")
+    suffix = Path(audio.filename or "").suffix.lower()
+    if suffix not in {".webm", ".wav", ".mp3", ".m4a", ".ogg"}:
+        suffix = ".webm"
+    audio_path = None
     try:
-        with open(audio_path, "wb") as f:
-            f.write(audio.file.read())
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to save audio: {str(e)}")
+        with tempfile.NamedTemporaryFile(
+            prefix="upload-", suffix=suffix, dir=TEMP_AUDIO_DIR, delete=False
+        ) as audio_file:
+            audio_path = audio_file.name
+        save_stream_with_limit(audio.file, audio_path, MAX_AUDIO_BYTES)
+    except UploadTooLargeError:
+        _remove_file_safely(audio_path)
+        raise HTTPException(
+            status_code=413,
+            detail=f"Audio file too large. Maximum size is {MAX_AUDIO_SIZE_MB}MB.",
+        ) from None
+    except Exception:
+        _remove_file_safely(audio_path)
+        logger.exception("Audio upload could not be saved")
+        raise HTTPException(status_code=500, detail="Audio upload failed.") from None
 
     # 2. Transcribe the audio
     try:
-        transcribed_text = transcribe_audio(audio_path)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+        transcribed_text = _validate_transcript(transcribe_audio(audio_path))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Uploaded audio transcription failed")
+        raise HTTPException(status_code=500, detail="Transcription failed.") from None
     finally:
         # Clean up temp file
-        if os.path.exists(audio_path):
-            try:
-                os.remove(audio_path)
-            except OSError:
-                pass
-
-    if not transcribed_text.strip():
-        raise HTTPException(status_code=400, detail="Could not transcribe any speech from the audio.")
+        _remove_file_safely(audio_path)
 
     # 3. Run RAG pipeline (same as /api/chat)
-    vectorstore = load_vectorstore()
-    context_docs = retrieve_context(vectorstore, transcribed_text, file_filter, top_k)
-    prompt = build_prompt(transcribed_text, context_docs)
+    context_docs, prompt = _retrieve_prompt(transcribed_text, file_filter, top_k)
 
     # 4. Stream response
     def generate():
@@ -282,31 +403,35 @@ def voice_chat(
     duration: int = Query(default=5, ge=1, le=30),
     file_filter: str = Query(default="All Files"),
     top_k: int = Query(default=5, ge=1, le=10),
-    speak: bool = Query(default=True),
+    speak: bool = Query(
+        default=True,
+        description="Reserved for compatibility; browser speech synthesis handles playback.",
+    ),
 ):
     """
-    Full voice chat: record on backend → transcribe → RAG → stream answer → speak.
+    Full voice chat: record on backend → transcribe → RAG → stream answer.
     Only works when backend runs on the same machine as the user.
+
+    ``speak`` is retained for client compatibility but is not used by the
+    backend; the supported frontend path speaks streamed text in the browser.
 
     Query params:
         duration: Recording duration in seconds
         file_filter: Filter to specific file
         top_k: Number of context chunks
-        speak: Whether to speak the answer via TTS
+        speak: Compatibility parameter; browser speech synthesis handles playback
     """
     # 1. Record and transcribe
     try:
-        transcribed_text = listen_and_transcribe(duration=duration)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Recording/transcription failed: {str(e)}")
-
-    if not transcribed_text.strip():
-        raise HTTPException(status_code=400, detail="Could not transcribe any speech.")
+        transcribed_text = _validate_transcript(listen_and_transcribe(duration=duration))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Voice chat recording/transcription failed")
+        raise HTTPException(status_code=500, detail="Recording/transcription failed.") from None
 
     # 2. Run RAG pipeline
-    vectorstore = load_vectorstore()
-    context_docs = retrieve_context(vectorstore, transcribed_text, file_filter, top_k)
-    prompt = build_prompt(transcribed_text, context_docs)
+    context_docs, prompt = _retrieve_prompt(transcribed_text, file_filter, top_k)
 
     # 3. Stream response
     def generate():

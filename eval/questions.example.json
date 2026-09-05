@@ -1,0 +1,14 @@
+[
+  {
+    "id": "example-01",
+    "query": "Replace this with a question answered by handbook.pdf.",
+    "expected_sources": ["handbook.pdf"],
+    "answerable": true
+  },
+  {
+    "id": "example-02",
+    "query": "Replace this with a question whose answer is not in the index.",
+    "expected_sources": [],
+    "answerable": false
+  }
+]

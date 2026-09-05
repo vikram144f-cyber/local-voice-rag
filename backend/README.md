@@ -1,7 +1,10 @@
-# Local Voice-Based RAG Assistant
+# Local Voice & Text RAG Assistant — backend
 
-A fully local, voice-enabled Retrieval-Augmented Generation (RAG) chatbot.  
-**No Ollama. No cloud APIs. No external endpoints.** Everything runs on your laptop.
+The FastAPI backend for a local-first voice and text Retrieval-Augmented
+Generation (RAG) application. After setup, embeddings, retrieval, GGUF
+generation, and speech-to-text run on the host machine. The API starts without
+blocking on model warm-up; the first feature request loads the required local
+model. The first setup may download Python packages and model weights.
 
 ---
 
@@ -32,8 +35,7 @@ VOICE QUERY PHASE:
   → transcribed text query
   → same RAG pipeline as above
   → text answer streamed to frontend
-  → pyttsx3 (local TTS, optional)
-  → speaker output
+  → browser SpeechSynthesis (frontend, optional)
 ```
 
 ---
@@ -42,7 +44,7 @@ VOICE QUERY PHASE:
 
 ### 1. LLM (GGUF format) — **Manual download required**
 Place a `.gguf` model file in `backend/models/`.  
-Default expected path: `backend/models/phi-3-mini-4k-instruct-q4.gguf`
+Default expected path: `backend/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf`
 
 If your file has a different name, update `MODEL_PATH` in `backend/local_llm.py`.
 
@@ -88,9 +90,13 @@ npm install
 ```bash
 cd backend
 venv\Scripts\activate
-uvicorn main:app --reload
+uvicorn main:app --host 127.0.0.1 --port 8000 --reload
 ```
-Backend runs at: `http://localhost:8000`
+Backend runs at: `http://127.0.0.1:8000`
+
+To warm already-downloaded models during startup, set
+`WARM_MODELS_ON_STARTUP=true` in the backend environment. It is disabled by
+default so `/health` and lightweight API routes remain available during setup.
 
 ### Start Frontend
 ```bash
@@ -123,7 +129,7 @@ curl -X POST http://localhost:8000/api/rebuild
 | `rag_core.py` | PDF loading, chunking, embeddings, FAISS operations, retrieval, prompt building |
 | `local_llm.py` | Loads GGUF model via llama-cpp-python, provides generate/stream functions |
 | `voice_input.py` | Records audio (sounddevice), transcribes (faster-whisper) |
-| `voice_output.py` | Text-to-speech via pyttsx3 (offline, uses OS TTS engine) |
+| `voice_output.py` | Standalone pyttsx3 text-to-speech helper (offline OS TTS; not wired into FastAPI) |
 | `main.py` | FastAPI app — all API endpoints (files, chat, voice, rebuild) |
 
 ---
@@ -145,9 +151,9 @@ curl -X POST http://localhost:8000/api/rebuild
 
 ## Known Limitations
 
-1. **First run requires internet** — to download embedding model and Whisper model. After that, fully offline.
+1. **First run may require internet** — to install packages and download embedding/Whisper model weights. After that, the configured model pipeline can run without hosted inference APIs.
 2. **GGUF model must be downloaded manually** — not auto-downloaded.
-3. **TTS (pyttsx3) plays on the server machine** — if backend is remote, TTS won't be heard by the user.
+3. **Browser TTS is the supported playback path** — `frontend/src/tts.js` uses browser `SpeechSynthesis`. `voice_output.py` contains a standalone `pyttsx3` helper but is not called by the FastAPI handlers.
 4. **llama-cpp-python on Windows** — may require Visual C++ Build Tools for compilation. If `pip install` fails, install [Visual C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/).
-5. **CPU-only inference** — LLM runs on CPU which is slower than GPU. Expect 5-15 seconds per response depending on model size and hardware.
+5. **Hardware behavior varies** — Whisper is configured for CPU int8; `llama-cpp-python` requests GPU offload when supported and otherwise runs on CPU. Response time depends on model size and hardware.
 6. **Voice recording in browser** — requires HTTPS or localhost. Won't work over plain HTTP on a remote server.

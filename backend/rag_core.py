@@ -1,12 +1,20 @@
 import os
 import json
 import logging
+import tempfile
+import uuid
 from dotenv import load_dotenv
 import shutil
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
+
+try:
+    from langchain_huggingface import HuggingFaceEmbeddings
+except ModuleNotFoundError:
+    # Keep lightweight API routes importable when the optional embedding adapter
+    # has not been installed yet. The indexing path reports the setup issue.
+    HuggingFaceEmbeddings = None
 
 # ─── Configuration ─────────────────────────────────────────────────────────────
 load_dotenv()
@@ -24,6 +32,10 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "512"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "100"))
 
+
+class NoExtractableTextError(ValueError):
+    """Raised when a valid PDF contains no text that can be indexed."""
+
 # Ensure directories exist
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 os.makedirs(VECTORSTORE_DIR, exist_ok=True)
@@ -39,8 +51,25 @@ def load_registry():
     return []
 
 def save_registry(registry):
-    with open(REGISTRY_FILE, "w") as f:
-        json.dump(registry, f, indent=4)
+    registry_dir = os.path.dirname(os.path.abspath(REGISTRY_FILE)) or "."
+    os.makedirs(registry_dir, exist_ok=True)
+    temporary_path = None
+    try:
+        fd, temporary_path = tempfile.mkstemp(
+            prefix=".uploaded-files-", suffix=".json", dir=registry_dir
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(registry, stream, indent=4)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, REGISTRY_FILE)
+        temporary_path = None
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            try:
+                os.remove(temporary_path)
+            except OSError:
+                logger.warning("Could not remove temporary registry %s", temporary_path)
 
 # ─── Vectorstore ─────────────────────────────────────────────────────────────
 _embeddings = None
@@ -54,6 +83,11 @@ def get_embeddings():
     """Create local HuggingFace embeddings."""
     global _embeddings
     if _embeddings is None:
+        if HuggingFaceEmbeddings is None:
+            raise RuntimeError(
+                "Embedding dependencies are not installed. "
+                "Install backend/requirements.txt to enable document indexing."
+            )
         import torch
         device = "cuda" if torch.cuda.is_available() else "cpu"
         logger.info("Initializing embeddings on device: %s", device)
@@ -68,6 +102,7 @@ def load_vectorstore():
     global _vectorstore_cache
     if _vectorstore_cache is not None:
         return _vectorstore_cache
+    # The index location is server configuration; no API request accepts a filesystem path.
     if not os.path.exists(os.path.join(VECTORSTORE_DIR, "index.faiss")):
         return None
     try:
@@ -99,6 +134,10 @@ def process_upload(file_path: str, filename: str):
         chunk_overlap=CHUNK_OVERLAP,
     )
     chunks = text_splitter.split_documents(docs)
+    if not chunks:
+        raise NoExtractableTextError(
+            "The PDF contains no extractable text. Upload a text-based PDF."
+        )
 
     # 3. Embed & Store
     embeddings = get_embeddings()
@@ -121,6 +160,74 @@ def process_upload(file_path: str, filename: str):
     
     return len(chunks)
 
+
+def _swap_vectorstore_directory(staged_dir: str):
+    """Replace the live index only after a complete staged index exists."""
+
+    live_dir = os.path.abspath(VECTORSTORE_DIR)
+    parent_dir = os.path.dirname(live_dir) or "."
+    backup_dir = None
+    if os.path.exists(live_dir):
+        backup_dir = os.path.join(parent_dir, f".vectorstore-backup-{uuid.uuid4().hex}")
+        os.replace(live_dir, backup_dir)
+
+    try:
+        os.replace(staged_dir, live_dir)
+    except Exception:
+        if backup_dir and os.path.exists(backup_dir) and not os.path.exists(live_dir):
+            os.replace(backup_dir, live_dir)
+        raise
+
+    if backup_dir and os.path.exists(backup_dir):
+        shutil.rmtree(backup_dir)
+
+
+def replace_file_and_rebuild(staged_path: str, filename: str):
+    """Replace one uploaded PDF and rebuild FAISS without stale chunks.
+
+    The previous PDF is retained until the staged file is in place and a new
+    index has been built. A failed rebuild restores the previous file and
+    rebuilds the previous index from its registry snapshot.
+    """
+
+    final_path = os.path.join(UPLOADS_DIR, filename)
+    previous_registry = load_registry()
+    next_registry = list(previous_registry)
+    if filename not in next_registry:
+        next_registry.append(filename)
+
+    backup_path = None
+    if os.path.exists(final_path):
+        backup_path = os.path.join(
+            UPLOADS_DIR, f".{filename}.{uuid.uuid4().hex}.backup"
+        )
+        os.replace(final_path, backup_path)
+
+    try:
+        os.replace(staged_path, final_path)
+        staged_path = None
+        rebuild_result = rebuild_all_files(
+            registry_override=next_registry, persist_registry=False
+        )
+        save_registry(rebuild_result["registry"])
+        return rebuild_result["chunks"]
+    except Exception:
+        if os.path.exists(final_path):
+            os.remove(final_path)
+        if backup_path and os.path.exists(backup_path):
+            os.replace(backup_path, final_path)
+        try:
+            rebuild_all_files(registry_override=previous_registry, persist_registry=False)
+        except Exception:
+            logger.exception("Could not restore the previous vectorstore after replacement failure")
+        raise
+    finally:
+        if backup_path and os.path.exists(backup_path):
+            try:
+                os.remove(backup_path)
+            except OSError:
+                logger.warning("Could not remove replacement backup %s", backup_path)
+
 def delete_file_and_rebuild(filename: str):
     """Delete a file and completely rebuild FAISS from remaining files."""
     file_path = os.path.join(UPLOADS_DIR, filename)
@@ -134,12 +241,8 @@ def delete_file_and_rebuild(filename: str):
         
     rebuild_all_files()
 
-def rebuild_all_files():
-    if os.path.exists(VECTORSTORE_DIR):
-        shutil.rmtree(VECTORSTORE_DIR)
-    os.makedirs(VECTORSTORE_DIR, exist_ok=True)
-    
-    registry = load_registry()
+def rebuild_all_files(registry_override=None, persist_registry=True):
+    registry = list(registry_override) if registry_override is not None else load_registry()
     embeddings = get_embeddings()
     
     all_chunks = []
@@ -161,15 +264,33 @@ def rebuild_all_files():
         )
         chunks = splitter.split_documents(docs)
         all_chunks.extend(chunks)
+
+    if valid_registry and not all_chunks:
+        raise NoExtractableTextError(
+            "No extractable text was found in the uploaded PDFs."
+        )
     
-    save_registry(valid_registry)
-    
+    vectorstore_parent = os.path.dirname(os.path.abspath(VECTORSTORE_DIR)) or "."
+    os.makedirs(vectorstore_parent, exist_ok=True)
+    staged_dir = tempfile.mkdtemp(prefix=".vectorstore-build-", dir=vectorstore_parent)
+    try:
+        vs = None
+        if all_chunks:
+            vs = FAISS.from_documents(all_chunks, embeddings)
+            vs.save_local(staged_dir)
+        _swap_vectorstore_directory(staged_dir)
+        staged_dir = None
+    finally:
+        if staged_dir and os.path.exists(staged_dir):
+            shutil.rmtree(staged_dir)
+
+    if persist_registry:
+        save_registry(valid_registry)
+
     global _vectorstore_cache
     invalidate_vectorstore_cache()
-    if all_chunks:
-        vs = FAISS.from_documents(all_chunks, embeddings)
-        vs.save_local(VECTORSTORE_DIR)
-        _vectorstore_cache = vs
+    _vectorstore_cache = vs
+    return {"registry": valid_registry, "chunks": len(all_chunks)}
 
 # ─── Chat Helpers ─────────────────────────────────────────────────────────────
 def retrieve_context(vectorstore, query: str, file_filter: str = None, top_k: int = 5):
